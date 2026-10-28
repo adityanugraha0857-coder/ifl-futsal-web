@@ -73,6 +73,11 @@ async function initializeData() {
   }
 }
 
+const databaseReady = initializeData();
+databaseReady.catch((error) => {
+  console.error("Gagal menyiapkan database aplikasi:", error);
+});
+
 app.disable("x-powered-by");
 // Hosting Node.js umumnya berada di belakang reverse proxy. Aktifkan hanya saat production.
 if (process.env.NODE_ENV === "production") app.set("trust proxy", 1);
@@ -94,6 +99,10 @@ app.use(
 );
 app.use(express.json({ limit: "100kb" }));
 app.use(express.urlencoded({ extended: false, limit: "20kb" }));
+
+app.use((req, res, next) => {
+  databaseReady.then(() => next(), next);
+});
 
 app.use(
   session({
@@ -538,17 +547,21 @@ function shutdown(signal) {
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
-initializeData()
-  .then(() => {
-    server = app.listen(PORT, () =>
-      console.log(`IFL Event website aktif di http://localhost:${PORT}`),
-    );
-  })
-  .catch((error) => {
-    console.error("Gagal menyiapkan database aplikasi:", error);
-    closeDatabase()
-      .catch((closeError) =>
-        console.error("Gagal menutup koneksi database:", closeError),
-      )
-      .finally(() => process.exit(1));
-  });
+if (require.main === module) {
+  databaseReady
+    .then(() => {
+      server = app.listen(PORT, () =>
+        console.log(`IFL Event website aktif di http://localhost:${PORT}`),
+      );
+    })
+    .catch((error) => {
+      console.error("Server tidak dapat dimulai:", error);
+      closeDatabase()
+        .catch((closeError) =>
+          console.error("Gagal menutup koneksi database:", closeError),
+        )
+        .finally(() => process.exit(1));
+    });
+}
+
+module.exports = app;

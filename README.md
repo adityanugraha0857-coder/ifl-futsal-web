@@ -6,6 +6,7 @@ Website event futsal dengan tampilan hitam-emas mengikuti logo yang diberikan. T
 - Node.js 20 atau lebih baru
 - npm
 - Supabase project untuk PostgreSQL production (opsional untuk mode SQLite lokal)
+- Vercel untuk menjalankan backend Express (atau hosting Node.js lain)
 - VS Code (disarankan)
 
 ## Menjalankan di VS Code
@@ -94,22 +95,22 @@ ifl-futsal-website/
 ## Folder `docs/` (mirror GitHub Pages)
 Folder `docs/` adalah salinan statis untuk GitHub Pages (workflow `pages.yml`) dengan path relatif. Setelah mengubah `public/index.html`, `public/app.js`, atau `public/styles.css`, salin perubahannya ke `docs/` dan sesuaikan path absolut (`/...`) menjadi relatif. `docs/admin.html` sengaja hanya berisi halaman info — panel admin asli hanya berjalan di server Node.js (`/admin`).
 
-## Menghubungkan Supabase dan deploy ke Render
+## Menghubungkan Supabase dan deploy ke Vercel
 
-1. Unggah isi folder proyek ini ke root repositori GitHub (jangan unggah `.env`, `data/`, atau `node_modules/`).
-2. Buat **Web Service** dari repositori tersebut di Render. Build command: `npm install`; Start command: `npm start`.
-3. Di Supabase, buka **Connect**, salin connection string PostgreSQL untuk **Session pooler**, lalu simpan sebagai secret `DATABASE_URL` di Render. Jangan gunakan `service_role` key: aplikasi terhubung langsung ke PostgreSQL.
-4. Atur environment variables di Render: `NODE_ENV=production`, `DATABASE_URL`, `SESSION_SECRET` (acak minimal 32 karakter), `ADMIN_USERNAME`, dan `ADMIN_PASSWORD` (unik, minimal 12 karakter). Jangan menaruh secret di GitHub.
-5. Deploy. Aplikasi membuat tabel `admins`, `events`, `matches`, `settings`, dan `sessions` saat startup. Website utama ada di `/` dan panel admin di `/admin`.
+1. Import repository GitHub ini ke Vercel.
+2. Pilih framework preset **Other** dan biarkan project root di root repository. Vercel menyajikan file di `public/` sebagai aset statis dan menjalankan `api/index.js` sebagai Node.js Function.
+3. Di Supabase, buka **Connect**, pilih **Transaction pooler** untuk serverless, lalu salin connection string PostgreSQL. Tambahkan sebagai environment variable `DATABASE_URL` di **Vercel → Project Settings → Environment Variables**. Jangan gunakan Supabase `service_role` key: backend terhubung langsung ke PostgreSQL.
+4. Tambahkan environment variables di Vercel: `DATABASE_URL`, `SESSION_SECRET` (acak minimal 32 karakter), `ADMIN_USERNAME`, dan `ADMIN_PASSWORD` (unik, minimal 12 karakter). Vercel mengatur `NODE_ENV=production` saat deployment production. Jangan commit secret ke GitHub.
+5. Redeploy. Aplikasi membuat tabel `admins`, `events`, `matches`, `settings`, dan `sessions` saat function mulai. Website utama ada di `/` dan panel admin di `/admin`.
 
-Sebelum menerima data penting, atur backup Supabase dan uji pemulihannya. GitHub Pages hanya menayangkan versi statis; login admin tidak berjalan di Pages.
+Jangan gunakan connection string database langsung di frontend. Simpan backup Supabase terpisah dan uji pemulihannya. GitHub Pages tetap hanya menayangkan versi statis; login admin aktif pada URL deployment Vercel.
 
 ### Migrasi data SQLite lokal yang sudah ada
 
-Sebelum aplikasi production pertama kali membuat data di Supabase, isi `DATABASE_URL` secara lokal pada `.env`, lalu jalankan:
+Sebelum aplikasi production pertama kali membuat data di Supabase, isi `DATABASE_URL` di `.env` lokal dengan connection string Supabase yang sama, lalu jalankan:
 
 ```bash
 npm run migrate:postgres
 ```
 
-Skrip menyalin admin, event, pertandingan, dan pengaturan dari `data/ifl-events.sqlite` ke tabel Supabase yang masih kosong; sesi login tidak dipindahkan. Migrasi dibatalkan bila tabel tujuan berisi data agar tidak menimpa data yang sudah ada. Setelah migrasi berhasil, set environment variables Render dan deploy aplikasi.
+Skrip menyalin admin, event, pertandingan, dan pengaturan dari `data/ifl-events.sqlite` ke tabel Supabase yang masih kosong; sesi login tidak dipindahkan. Migrasi dibatalkan bila tabel tujuan berisi data agar tidak menimpa data yang sudah ada. Setelah migrasi berhasil, masukkan `DATABASE_URL` dan environment variables lain di Vercel lalu deploy.
