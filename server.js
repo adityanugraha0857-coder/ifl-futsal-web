@@ -2,18 +2,19 @@ require("dotenv").config();
 
 const express = require("express");
 const session = require("express-session");
-const SQLiteStoreFactory = require("connect-sqlite3");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const path = require("path");
-const fs = require("fs");
 const bcrypt = require("bcryptjs");
-const Database = require("better-sqlite3");
+const {
+  closeDatabase,
+  createSessionStore,
+  db,
+  initDatabase,
+} = require("./lib/database");
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
-fs.mkdirSync(DATA_DIR, { recursive: true });
 
 if (
   !process.env.SESSION_SECRET ||
@@ -32,76 +33,43 @@ if (
   );
 }
 
-const db = new Database(path.join(DATA_DIR, "ifl-events.sqlite"));
-db.pragma("journal_mode = WAL");
-db.pragma("foreign_keys = ON");
-db.exec(`
-  CREATE TABLE IF NOT EXISTS admins (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT NOT NULL UNIQUE,
-    password_hash TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE TABLE IF NOT EXISTS events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL,
-    category TEXT NOT NULL DEFAULT 'Turnamen',
-    location TEXT NOT NULL DEFAULT 'Pontianak',
-    start_date TEXT NOT NULL,
-    end_date TEXT,
-    status TEXT NOT NULL DEFAULT 'Akan Datang',
-    description TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE TABLE IF NOT EXISTS matches (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    event_id INTEGER,
-    match_date TEXT NOT NULL,
-    match_time TEXT NOT NULL DEFAULT '',
-    home_team TEXT NOT NULL,
-    away_team TEXT NOT NULL,
-    home_score INTEGER,
-    away_score INTEGER,
-    venue TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL DEFAULT 'Terjadwal',
-    round_name TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(event_id) REFERENCES events(id) ON DELETE SET NULL
-  );
-  CREATE TABLE IF NOT EXISTS settings (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-  );
-`);
+async function initializeData() {
+  await initDatabase();
 
-const seedSettings = db.prepare(
-  "INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)",
-);
-[
-  ["contact_name", "Panitia IFL Event"],
-  ["contact_phone", "Isi nomor WhatsApp panitia melalui panel admin"],
-  ["contact_email", ""],
-  ["venue", "Pontianak, Kalimantan Barat"],
-  [
-    "about",
-    "IFL Event menghadirkan kompetisi futsal, kegiatan komunitas, expo, dan seminar. Bersama Fafage Academy Pontianak, kami mendukung perkembangan talenta futsal dan semangat sportivitas.",
-  ],
-].forEach((row) => seedSettings.run(...row));
+  const defaultSettings = [
+    ["contact_name", "Panitia IFL Event"],
+    ["contact_phone", "Isi nomor WhatsApp panitia melalui panel admin"],
+    ["contact_email", ""],
+    ["venue", "Pontianak, Kalimantan Barat"],
+    [
+      "about",
+      "IFL Event menghadirkan kompetisi futsal, kegiatan komunitas, expo, dan seminar. Bersama Fafage Academy Pontianak, kami mendukung perkembangan talenta futsal dan semangat sportivitas.",
+    ],
+  ];
+  for (const [key, value] of defaultSettings) {
+    await db.run(
+      "INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO NOTHING",
+      [key, value],
+    );
+  }
 
-const adminCount = db.prepare("SELECT COUNT(*) AS n FROM admins").get().n;
-if (adminCount === 0) {
-  const username = process.env.ADMIN_USERNAME;
-  const password = process.env.ADMIN_PASSWORD;
-  if (username && password && password.length >= 12) {
-    db.prepare("INSERT INTO admins(username,password_hash) VALUES (?,?)").run(
-      username,
-      bcrypt.hashSync(password, 12),
-    );
-    console.log(
-      `Akun admin awal dibuat untuk username "${username}". Ganti password setelah login pertama.`,
-    );
-  } else {
-    console.warn("Belum ada admin. Jalankan: npm run init-admin");
+  const adminCount = Number(
+    (await db.get("SELECT COUNT(*) AS n FROM admins")).n,
+  );
+  if (adminCount === 0) {
+    const username = process.env.ADMIN_USERNAME;
+    const password = process.env.ADMIN_PASSWORD;
+    if (username && password && password.length >= 12) {
+      await db.run(
+        "INSERT INTO admins(username,password_hash) VALUES(?,?)",
+        [username, bcrypt.hashSync(password, 12)],
+      );
+      console.log(
+        `Akun admin awal dibuat untuk username "${username}". Ganti password setelah login pertama.`,
+      );
+    } else {
+      console.warn("Belum ada admin. Jalankan: npm run init-admin");
+    }
   }
 }
 
@@ -127,14 +95,9 @@ app.use(
 app.use(express.json({ limit: "100kb" }));
 app.use(express.urlencoded({ extended: false, limit: "20kb" }));
 
-const SQLiteStore = SQLiteStoreFactory(session);
 app.use(
   session({
-    store: new SQLiteStore({
-      db: "sessions.sqlite",
-      dir: DATA_DIR,
-      table: "sessions",
-    }),
+    store: createSessionStore(session),
     secret:
       process.env.SESSION_SECRET ||
       "development-only-secret-not-for-production-123456",
@@ -208,56 +171,65 @@ function validDate(value) {
 function apiError(res, message, code = 400) {
   return res.status(code).json({ error: message });
 }
+function asyncRoute(handler) {
+  return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
+}
 
-app.get("/api/public", (req, res) => {
-  const events = db
-    .prepare(`SELECT * FROM events ORDER BY start_date ASC, id DESC`)
-    .all();
-  const matches = db
-    .prepare(
+app.get(
+  "/api/public",
+  asyncRoute(async (req, res) => {
+    const events = await db.all(
+      `SELECT * FROM events ORDER BY start_date ASC, id DESC`,
+    );
+    const matches = await db.all(
       `
     SELECT m.*, e.title AS event_title FROM matches m
     LEFT JOIN events e ON e.id=m.event_id
     ORDER BY m.match_date ASC, m.match_time ASC, m.id DESC
   `,
-    )
-    .all();
-  const settings = Object.fromEntries(
-    db
-      .prepare("SELECT key,value FROM settings")
-      .all()
-      .map((x) => [x.key, x.value]),
-  );
-  res.json({ events, matches, settings });
-});
+    );
+    const settings = Object.fromEntries(
+      (await db.all("SELECT key,value FROM settings")).map((x) => [
+        x.key,
+        x.value,
+      ]),
+    );
+    res.json({ events, matches, settings });
+  }),
+);
 
-app.post("/api/login", loginLimiter, (req, res, next) => {
-  const username = cleanText(req.body.username, 80);
-  const password = String(req.body.password ?? "");
-  const admin = db
-    .prepare("SELECT * FROM admins WHERE username=?")
-    .get(username);
-  if (!admin || !bcrypt.compareSync(password, admin.password_hash)) {
-    return apiError(res, "Username atau password salah.", 401);
-  }
-  req.session.regenerate((err) => {
-    if (err) return next(err);
-    req.session.adminId = admin.id;
-    req.session.username = admin.username;
-    req.session.save((err2) => {
-      if (err2) return next(err2);
-      res.json({ ok: true, username: admin.username });
+app.post(
+  "/api/login",
+  loginLimiter,
+  asyncRoute(async (req, res, next) => {
+    const username = cleanText(req.body.username, 80);
+    const password = String(req.body.password ?? "");
+    const admin = await db.get("SELECT * FROM admins WHERE username=?", [
+      username,
+    ]);
+    if (!admin || !bcrypt.compareSync(password, admin.password_hash)) {
+      return apiError(res, "Username atau password salah.", 401);
+    }
+    req.session.regenerate((err) => {
+      if (err) return next(err);
+      req.session.adminId = admin.id;
+      req.session.username = admin.username;
+      req.session.save((err2) => {
+        if (err2) return next(err2);
+        res.json({ ok: true, username: admin.username });
+      });
     });
-  });
-});
+  }),
+);
 app.get("/api/session", (req, res) => {
   res.json({
     authenticated: Boolean(req.session.adminId),
     username: req.session.username || "",
   });
 });
-app.post("/api/logout", (req, res) => {
-  req.session.destroy(() => {
+app.post("/api/logout", (req, res, next) => {
+  req.session.destroy((error) => {
+    if (error) return next(error);
     res.clearCookie("ifl.sid", {
       httpOnly: true,
       sameSite: "strict",
@@ -267,227 +239,270 @@ app.post("/api/logout", (req, res) => {
   });
 });
 
-app.get("/api/admin/data", requireAdmin, (req, res) => {
-  const events = db
-    .prepare("SELECT * FROM events ORDER BY start_date DESC, id DESC")
-    .all();
-  const matches = db
-    .prepare(
+app.get(
+  "/api/admin/data",
+  requireAdmin,
+  asyncRoute(async (req, res) => {
+    const events = await db.all(
+      "SELECT * FROM events ORDER BY start_date DESC, id DESC",
+    );
+    const matches = await db.all(
       `SELECT m.*, e.title AS event_title FROM matches m LEFT JOIN events e ON e.id=m.event_id ORDER BY m.match_date DESC,m.match_time DESC,m.id DESC`,
-    )
-    .all();
-  const settings = Object.fromEntries(
-    db
-      .prepare("SELECT key,value FROM settings")
-      .all()
-      .map((x) => [x.key, x.value]),
-  );
-  res.json({ events, matches, settings, username: req.session.username });
-});
-
-app.post("/api/admin/events", requireAdmin, (req, res) => {
-  const b = req.body || {};
-  const title = cleanText(b.title, 120);
-  const category = cleanText(b.category || "Turnamen", 60);
-  const location = cleanText(b.location || "Pontianak", 160);
-  const startDate = cleanText(b.start_date, 10);
-  const endDate = b.end_date ? cleanText(b.end_date, 10) : null;
-  const status = cleanText(b.status || "Akan Datang", 40);
-  const description = cleanText(b.description, 2000);
-  if (!title || !validDate(startDate))
-    return apiError(
-      res,
-      "Nama event dan tanggal mulai wajib diisi dengan benar.",
     );
-  if (endDate && (!validDate(endDate) || endDate < startDate))
-    return apiError(res, "Tanggal selesai tidak valid.");
-  const info = db
-    .prepare(
-      `INSERT INTO events(title,category,location,start_date,end_date,status,description) VALUES(?,?,?,?,?,?,?)`,
-    )
-    .run(title, category, location, startDate, endDate, status, description);
-  res.status(201).json({ id: Number(info.lastInsertRowid) });
-});
-app.put("/api/admin/events/:id", requireAdmin, (req, res) => {
-  const id = Number(req.params.id);
-  const b = req.body || {};
-  const title = cleanText(b.title, 120);
-  const startDate = cleanText(b.start_date, 10);
-  const endDate = b.end_date ? cleanText(b.end_date, 10) : null;
-  if (!Number.isInteger(id) || id < 1 || !title || !validDate(startDate))
-    return apiError(res, "Data event tidak valid.");
-  if (endDate && (!validDate(endDate) || endDate < startDate))
-    return apiError(res, "Tanggal selesai tidak valid.");
-  const info = db
-    .prepare(
+    const settings = Object.fromEntries(
+      (await db.all("SELECT key,value FROM settings")).map((x) => [
+        x.key,
+        x.value,
+      ]),
+    );
+    res.json({ events, matches, settings, username: req.session.username });
+  }),
+);
+
+app.post(
+  "/api/admin/events",
+  requireAdmin,
+  asyncRoute(async (req, res) => {
+    const b = req.body || {};
+    const title = cleanText(b.title, 120);
+    const category = cleanText(b.category || "Turnamen", 60);
+    const location = cleanText(b.location || "Pontianak", 160);
+    const startDate = cleanText(b.start_date, 10);
+    const endDate = b.end_date ? cleanText(b.end_date, 10) : null;
+    const status = cleanText(b.status || "Akan Datang", 40);
+    const description = cleanText(b.description, 2000);
+    if (!title || !validDate(startDate))
+      return apiError(
+        res,
+        "Nama event dan tanggal mulai wajib diisi dengan benar.",
+      );
+    if (endDate && (!validDate(endDate) || endDate < startDate))
+      return apiError(res, "Tanggal selesai tidak valid.");
+    const info = await db.run(
+      `INSERT INTO events(title,category,location,start_date,end_date,status,description) VALUES(?,?,?,?,?,?,?) RETURNING id`,
+      [title, category, location, startDate, endDate, status, description],
+    );
+    res.status(201).json({ id: Number(info.id) });
+  }),
+);
+app.put(
+  "/api/admin/events/:id",
+  requireAdmin,
+  asyncRoute(async (req, res) => {
+    const id = Number(req.params.id);
+    const b = req.body || {};
+    const title = cleanText(b.title, 120);
+    const startDate = cleanText(b.start_date, 10);
+    const endDate = b.end_date ? cleanText(b.end_date, 10) : null;
+    if (!Number.isInteger(id) || id < 1 || !title || !validDate(startDate))
+      return apiError(res, "Data event tidak valid.");
+    if (endDate && (!validDate(endDate) || endDate < startDate))
+      return apiError(res, "Tanggal selesai tidak valid.");
+    const info = await db.run(
       `UPDATE events SET title=?,category=?,location=?,start_date=?,end_date=?,status=?,description=? WHERE id=?`,
-    )
-    .run(
-      title,
-      cleanText(b.category || "Turnamen", 60),
-      cleanText(b.location || "Pontianak", 160),
-      startDate,
-      endDate,
-      cleanText(b.status || "Akan Datang", 40),
-      cleanText(b.description, 2000),
-      id,
+      [
+        title,
+        cleanText(b.category || "Turnamen", 60),
+        cleanText(b.location || "Pontianak", 160),
+        startDate,
+        endDate,
+        cleanText(b.status || "Akan Datang", 40),
+        cleanText(b.description, 2000),
+        id,
+      ],
     );
-  if (!info.changes) return apiError(res, "Event tidak ditemukan.", 404);
-  res.json({ ok: true });
-});
-app.delete("/api/admin/events/:id", requireAdmin, (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isInteger(id) || id < 1) return apiError(res, "ID tidak valid.");
-  const info = db.prepare("DELETE FROM events WHERE id=?").run(id);
-  if (!info.changes) return apiError(res, "Event tidak ditemukan.", 404);
-  res.json({ ok: true });
-});
+    if (!info.changes) return apiError(res, "Event tidak ditemukan.", 404);
+    res.json({ ok: true });
+  }),
+);
+app.delete(
+  "/api/admin/events/:id",
+  requireAdmin,
+  asyncRoute(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id < 1)
+      return apiError(res, "ID tidak valid.");
+    const info = await db.run("DELETE FROM events WHERE id=?", [id]);
+    if (!info.changes) return apiError(res, "Event tidak ditemukan.", 404);
+    res.json({ ok: true });
+  }),
+);
 
-app.post("/api/admin/matches", requireAdmin, (req, res) => {
-  const b = req.body || {};
-  const matchDate = cleanText(b.match_date, 10);
-  const home = cleanText(b.home_team, 100);
-  const away = cleanText(b.away_team, 100);
-  const homeScore =
-    b.home_score === "" || b.home_score == null ? null : Number(b.home_score);
-  const awayScore =
-    b.away_score === "" || b.away_score == null ? null : Number(b.away_score);
-  if (!validDate(matchDate) || !home || !away || home === away)
-    return apiError(
-      res,
-      "Tanggal dan dua nama tim wajib diisi. Nama tim harus berbeda.",
+app.post(
+  "/api/admin/matches",
+  requireAdmin,
+  asyncRoute(async (req, res) => {
+    const b = req.body || {};
+    const matchDate = cleanText(b.match_date, 10);
+    const home = cleanText(b.home_team, 100);
+    const away = cleanText(b.away_team, 100);
+    const homeScore =
+      b.home_score === "" || b.home_score == null ? null : Number(b.home_score);
+    const awayScore =
+      b.away_score === "" || b.away_score == null ? null : Number(b.away_score);
+    if (!validDate(matchDate) || !home || !away || home === away)
+      return apiError(
+        res,
+        "Tanggal dan dua nama tim wajib diisi. Nama tim harus berbeda.",
+      );
+    if (
+      (homeScore !== null &&
+        (!Number.isInteger(homeScore) || homeScore < 0 || homeScore > 99)) ||
+      (awayScore !== null &&
+        (!Number.isInteger(awayScore) || awayScore < 0 || awayScore > 99))
+    )
+      return apiError(res, "Skor harus berupa angka 0–99.");
+    const eventId = b.event_id ? Number(b.event_id) : null;
+    if (
+      eventId !== null &&
+      (!Number.isInteger(eventId) ||
+        !(await db.get("SELECT id FROM events WHERE id=?", [eventId])))
+    )
+      return apiError(res, "Event yang dipilih tidak ditemukan.");
+    const status = cleanText(
+      b.status ||
+        (homeScore !== null && awayScore !== null ? "Selesai" : "Terjadwal"),
+      30,
     );
-  if (
-    (homeScore !== null &&
-      (!Number.isInteger(homeScore) || homeScore < 0 || homeScore > 99)) ||
-    (awayScore !== null &&
-      (!Number.isInteger(awayScore) || awayScore < 0 || awayScore > 99))
-  )
-    return apiError(res, "Skor harus berupa angka 0–99.");
-  const eventId = b.event_id ? Number(b.event_id) : null;
-  if (eventId && !db.prepare("SELECT id FROM events WHERE id=?").get(eventId))
-    return apiError(res, "Event yang dipilih tidak ditemukan.");
-  const status = cleanText(
-    b.status ||
-      (homeScore !== null && awayScore !== null ? "Selesai" : "Terjadwal"),
-    30,
-  );
-  const info = db
-    .prepare(
+    const info = await db.run(
       `INSERT INTO matches(event_id,match_date,match_time,home_team,away_team,home_score,away_score,venue,status,round_name)
-    VALUES(?,?,?,?,?,?,?,?,?,?)`,
-    )
-    .run(
-      eventId,
-      matchDate,
-      cleanText(b.match_time, 5),
-      home,
-      away,
-      homeScore,
-      awayScore,
-      cleanText(b.venue, 160),
-      status,
-      cleanText(b.round_name, 100),
+      VALUES(?,?,?,?,?,?,?,?,?,?) RETURNING id`,
+      [
+        eventId,
+        matchDate,
+        cleanText(b.match_time, 5),
+        home,
+        away,
+        homeScore,
+        awayScore,
+        cleanText(b.venue, 160),
+        status,
+        cleanText(b.round_name, 100),
+      ],
     );
-  res.status(201).json({ id: Number(info.lastInsertRowid) });
-});
-app.put("/api/admin/matches/:id", requireAdmin, (req, res) => {
-  const id = Number(req.params.id);
-  const b = req.body || {};
-  const matchDate = cleanText(b.match_date, 10);
-  const home = cleanText(b.home_team, 100);
-  const away = cleanText(b.away_team, 100);
-  const homeScore =
-    b.home_score === "" || b.home_score == null ? null : Number(b.home_score);
-  const awayScore =
-    b.away_score === "" || b.away_score == null ? null : Number(b.away_score);
-  if (
-    !Number.isInteger(id) ||
-    id < 1 ||
-    !validDate(matchDate) ||
-    !home ||
-    !away ||
-    home === away
-  )
-    return apiError(res, "Data pertandingan tidak valid.");
-  if (
-    (homeScore !== null &&
-      (!Number.isInteger(homeScore) || homeScore < 0 || homeScore > 99)) ||
-    (awayScore !== null &&
-      (!Number.isInteger(awayScore) || awayScore < 0 || awayScore > 99))
-  )
-    return apiError(res, "Skor harus berupa angka 0–99.");
-  const eventId = b.event_id ? Number(b.event_id) : null;
-  if (eventId && !db.prepare("SELECT id FROM events WHERE id=?").get(eventId))
-    return apiError(res, "Event yang dipilih tidak ditemukan.");
-  const info = db
-    .prepare(
+    res.status(201).json({ id: Number(info.id) });
+  }),
+);
+app.put(
+  "/api/admin/matches/:id",
+  requireAdmin,
+  asyncRoute(async (req, res) => {
+    const id = Number(req.params.id);
+    const b = req.body || {};
+    const matchDate = cleanText(b.match_date, 10);
+    const home = cleanText(b.home_team, 100);
+    const away = cleanText(b.away_team, 100);
+    const homeScore =
+      b.home_score === "" || b.home_score == null ? null : Number(b.home_score);
+    const awayScore =
+      b.away_score === "" || b.away_score == null ? null : Number(b.away_score);
+    if (
+      !Number.isInteger(id) ||
+      id < 1 ||
+      !validDate(matchDate) ||
+      !home ||
+      !away ||
+      home === away
+    )
+      return apiError(res, "Data pertandingan tidak valid.");
+    if (
+      (homeScore !== null &&
+        (!Number.isInteger(homeScore) || homeScore < 0 || homeScore > 99)) ||
+      (awayScore !== null &&
+        (!Number.isInteger(awayScore) || awayScore < 0 || awayScore > 99))
+    )
+      return apiError(res, "Skor harus berupa angka 0–99.");
+    const eventId = b.event_id ? Number(b.event_id) : null;
+    if (
+      eventId !== null &&
+      (!Number.isInteger(eventId) ||
+        !(await db.get("SELECT id FROM events WHERE id=?", [eventId])))
+    )
+      return apiError(res, "Event yang dipilih tidak ditemukan.");
+    const info = await db.run(
       `UPDATE matches SET event_id=?,match_date=?,match_time=?,home_team=?,away_team=?,home_score=?,away_score=?,venue=?,status=?,round_name=? WHERE id=?`,
-    )
-    .run(
-      eventId,
-      matchDate,
-      cleanText(b.match_time, 5),
-      home,
-      away,
-      homeScore,
-      awayScore,
-      cleanText(b.venue, 160),
-      cleanText(
-        b.status ||
-          (homeScore !== null && awayScore !== null ? "Selesai" : "Terjadwal"),
-        30,
-      ),
-      cleanText(b.round_name, 100),
-      id,
+      [
+        eventId,
+        matchDate,
+        cleanText(b.match_time, 5),
+        home,
+        away,
+        homeScore,
+        awayScore,
+        cleanText(b.venue, 160),
+        cleanText(
+          b.status ||
+            (homeScore !== null && awayScore !== null ? "Selesai" : "Terjadwal"),
+          30,
+        ),
+        cleanText(b.round_name, 100),
+        id,
+      ],
     );
-  if (!info.changes) return apiError(res, "Pertandingan tidak ditemukan.", 404);
-  res.json({ ok: true });
-});
-app.delete("/api/admin/matches/:id", requireAdmin, (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isInteger(id) || id < 1) return apiError(res, "ID tidak valid.");
-  const info = db.prepare("DELETE FROM matches WHERE id=?").run(id);
-  if (!info.changes) return apiError(res, "Pertandingan tidak ditemukan.", 404);
-  res.json({ ok: true });
-});
+    if (!info.changes)
+      return apiError(res, "Pertandingan tidak ditemukan.", 404);
+    res.json({ ok: true });
+  }),
+);
+app.delete(
+  "/api/admin/matches/:id",
+  requireAdmin,
+  asyncRoute(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id < 1)
+      return apiError(res, "ID tidak valid.");
+    const info = await db.run("DELETE FROM matches WHERE id=?", [id]);
+    if (!info.changes)
+      return apiError(res, "Pertandingan tidak ditemukan.", 404);
+    res.json({ ok: true });
+  }),
+);
 
-app.put("/api/admin/settings", requireAdmin, (req, res) => {
-  const b = req.body || {};
-  const allowed = [
-    "contact_name",
-    "contact_phone",
-    "contact_email",
-    "venue",
-    "about",
-  ];
-  const upsert = db.prepare(
-    "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-  );
-  const tx = db.transaction(() => {
-    for (const key of allowed)
-      if (Object.prototype.hasOwnProperty.call(b, key))
-        upsert.run(key, cleanText(b[key], key === "about" ? 2000 : 250));
-  });
-  tx();
-  res.json({ ok: true });
-});
-app.post("/api/admin/change-password", requireAdmin, (req, res) => {
-  const current = String(req.body.current_password ?? "");
-  const next = String(req.body.new_password ?? "");
-  if (next.length < 12 || next.length > 200)
-    return apiError(res, "Password baru harus 12–200 karakter.");
-  const admin = db
-    .prepare("SELECT * FROM admins WHERE id=?")
-    .get(req.session.adminId);
-  if (!admin || !bcrypt.compareSync(current, admin.password_hash))
-    return apiError(res, "Password saat ini salah.", 401);
-  db.prepare("UPDATE admins SET password_hash=? WHERE id=?").run(
-    bcrypt.hashSync(next, 12),
-    admin.id,
-  );
-  res.json({ ok: true });
-});
+app.put(
+  "/api/admin/settings",
+  requireAdmin,
+  asyncRoute(async (req, res) => {
+    const b = req.body || {};
+    const allowed = [
+      "contact_name",
+      "contact_phone",
+      "contact_email",
+      "venue",
+      "about",
+    ];
+    await db.transaction(async (tx) => {
+      for (const key of allowed) {
+        if (Object.prototype.hasOwnProperty.call(b, key)) {
+          await tx.run(
+            "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [key, cleanText(b[key], key === "about" ? 2000 : 250)],
+          );
+        }
+      }
+    });
+    res.json({ ok: true });
+  }),
+);
+app.post(
+  "/api/admin/change-password",
+  requireAdmin,
+  asyncRoute(async (req, res) => {
+    const current = String(req.body.current_password ?? "");
+    const next = String(req.body.new_password ?? "");
+    if (next.length < 12 || next.length > 200)
+      return apiError(res, "Password baru harus 12–200 karakter.");
+    const admin = await db.get("SELECT * FROM admins WHERE id=?", [
+      req.session.adminId,
+    ]);
+    if (!admin || !bcrypt.compareSync(current, admin.password_hash))
+      return apiError(res, "Password saat ini salah.", 401);
+    await db.run("UPDATE admins SET password_hash=? WHERE id=?", [
+      bcrypt.hashSync(next, 12),
+      admin.id,
+    ]);
+    res.json({ ok: true });
+  }),
+);
 
 app.use("/api", (req, res) =>
   res.status(404).json({ error: "Endpoint API tidak ditemukan." }),
@@ -506,18 +521,34 @@ app.use((err, req, res, next) => {
     .json({ error: "Terjadi kesalahan server. Periksa log aplikasi." });
 });
 
-const server = app.listen(PORT, () =>
-  console.log(`IFL Event website aktif di http://localhost:${PORT}`),
-);
+let server;
 function shutdown(signal) {
+  if (!server) return;
   console.log(`Menerima ${signal}, menutup server...`);
   server.close(() => {
-    try {
-      db.close();
-    } catch {}
-    process.exit(0);
+    closeDatabase()
+      .then(() => process.exit(0))
+      .catch((error) => {
+        console.error("Gagal menutup koneksi database:", error);
+        process.exit(1);
+      });
   });
   setTimeout(() => process.exit(0), 5000).unref();
 }
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
+
+initializeData()
+  .then(() => {
+    server = app.listen(PORT, () =>
+      console.log(`IFL Event website aktif di http://localhost:${PORT}`),
+    );
+  })
+  .catch((error) => {
+    console.error("Gagal menyiapkan database aplikasi:", error);
+    closeDatabase()
+      .catch((closeError) =>
+        console.error("Gagal menutup koneksi database:", closeError),
+      )
+      .finally(() => process.exit(1));
+  });
